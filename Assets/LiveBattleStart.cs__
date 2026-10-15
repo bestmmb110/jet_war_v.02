@@ -1,0 +1,508 @@
+using System.Collections.Generic;
+using System.Text;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+// Standalone add-on for Air Strike Starter Kit. It does NOT modify any original file:
+// it switches off the original GUI scripts (GameUI, Mainmeu) at runtime and draws its own.
+//
+//  * Play  -> live auto-battle scene ("Mainmenu") first, with the new credits text.
+//  * ENTER in the live scene -> starts Modern, then Classic, then Invasion, then Modern again...
+//  * In a game: no Gyroscope / Change View / Change Weapons / Simple Control buttons, no key hints.
+//  * Every game lasts 180 seconds, then a success / failure message is shown (ENTER = back to live scene).
+//  * If armor reaches 0 (jet destroyed) before time is up, the same style restarts at once (no Restart / Main menu screen).
+//  * ESC during a game -> back to the live scene.
+public class LiveBattleStart : MonoBehaviour
+{
+	const string LiveScene = "Mainmenu";
+	static readonly string[] Styles = { "Modern", "Classic", "Invasion" };
+	const float GameSeconds = 180f;
+	const bool ShowStartHint = true; // small "PRESS ENTER TO START" line in the live scene
+
+	// Persian messages (shown at the end of a game)
+	const string MsgSuccess = "به شما تبریک میگم در ماموریت دفاع از وطن موفق بودید";
+	const string MsgFail = "در ماموریت دفاع از وطن موفق نبودی میتونی بیشتر تلاش کنی ؟";
+
+	static bool bootDone;
+	static int nextStyle;
+
+	enum Mode { None, Live, Game }
+	Mode mode;
+	bool skipInitialSetup;
+	bool reloading;
+
+	string styleName;
+	float elapsed;
+	bool ended;
+	bool won;
+	int startHP = -1;
+	int armorLost;
+
+	GameUI gameUI;
+	PlayerController player;
+	DamageManager damage;
+	WeaponController weapon;
+	GameManager manager;
+	GUISkin skin;
+	Texture2D logo;
+
+	Font persianFont;
+	bool stylesBuilt;
+	GUIStyle sTitle, sSub, sBody, sSlogan, sCredit, sHint;
+	GUIStyle sHudL, sHudR, sHudC, sSmallR, sFa, sInfo;
+
+	// ------------------------------------------------------------ boot
+
+	[RuntimeInitializeOnLoadMethod (RuntimeInitializeLoadType.AfterSceneLoad)]
+	static void Boot ()
+	{
+		if (bootDone)
+			return;
+		bootDone = true;
+
+		GameObject go = new GameObject ("LiveBattleStart");
+		DontDestroyOnLoad (go);
+		LiveBattleStart host = go.AddComponent<LiveBattleStart> ();
+
+		if (SceneManager.GetActiveScene ().name != LiveScene) {
+			host.skipInitialSetup = true;
+			SceneManager.LoadScene (LiveScene);
+		}
+	}
+
+	void OnEnable ()
+	{
+		SceneManager.sceneLoaded += OnSceneLoaded;
+	}
+
+	void OnDisable ()
+	{
+		SceneManager.sceneLoaded -= OnSceneLoaded;
+	}
+
+	void Start ()
+	{
+		if (!skipInitialSetup)
+			Setup (SceneManager.GetActiveScene ());
+	}
+
+	void OnSceneLoaded (Scene scene, LoadSceneMode loadMode)
+	{
+		Setup (scene);
+	}
+
+	static bool IsStyle (string sceneName)
+	{
+		for (int i = 0; i < Styles.Length; i++)
+			if (Styles [i] == sceneName)
+				return true;
+		return false;
+	}
+
+	void Setup (Scene scene)
+	{
+		mode = Mode.None;
+		reloading = false;
+		ended = false;
+		won = false;
+		elapsed = 0;
+		startHP = -1;
+		armorLost = 0;
+		gameUI = null;
+		player = null;
+		damage = null;
+		weapon = null;
+		manager = null;
+		skin = null;
+		logo = null;
+		stylesBuilt = false;
+		Time.timeScale = 1;
+
+		if (scene.name == LiveScene) {
+			mode = Mode.Live;
+			Mainmeu menu = Object.FindFirstObjectByType<Mainmeu> ();
+			if (menu) {
+				skin = menu.skin;
+				logo = menu.Logo; // the logo texture is whatever is assigned on the original Mainmeu component
+				menu.enabled = false; // hides the original Classic / Modern / Invasion buttons and credits
+			}
+			Cursor.lockState = CursorLockMode.None;
+			Cursor.visible = true;
+		} else if (IsStyle (scene.name)) {
+			mode = Mode.Game;
+			styleName = scene.name;
+			GameUI[] uis = Object.FindObjectsByType<GameUI> (FindObjectsSortMode.None);
+			for (int i = 0; i < uis.Length; i++) {
+				if (!gameUI)
+					gameUI = uis [i];
+				if (!skin)
+					skin = uis [i].skin;
+				if (!logo)
+					logo = uis [i].Logo;
+				uis [i].enabled = false; // hides the original HUD, key hints and Pause / Game Over screens
+			}
+			manager = Object.FindFirstObjectByType<GameManager> ();
+		}
+	}
+
+	// ------------------------------------------------------------ logic
+
+	static bool EnterPressed ()
+	{
+		return Input.GetKeyDown (KeyCode.Return) || Input.GetKeyDown (KeyCode.KeypadEnter);
+	}
+
+	void Update ()
+	{
+		if (mode == Mode.Live) {
+			if (EnterPressed ()) {
+				string style = Styles [nextStyle];
+				nextStyle = (nextStyle + 1) % Styles.Length;
+				SceneManager.LoadScene (style);
+			}
+			return;
+		}
+
+		if (mode != Mode.Game || reloading)
+			return;
+
+		if (Input.GetKeyDown (KeyCode.Escape) || (ended && EnterPressed ())) {
+			Time.timeScale = 1;
+			SceneManager.LoadScene (LiveScene);
+			return;
+		}
+
+		if (!manager)
+			manager = Object.FindFirstObjectByType<GameManager> ();
+
+		if (!player) {
+			player = Object.FindFirstObjectByType<PlayerController> ();
+			if (player) {
+				damage = player.GetComponent<DamageManager> ();
+				weapon = player.GetComponent<WeaponController> ();
+				if (damage && startHP < 0)
+					startHP = damage.HP;
+			}
+		}
+		if (player)
+			player.ShowHowto = false; // hides Gyroscope / Change View / Change Weapons / Simple Control buttons
+
+		if (ended)
+			return;
+
+		// Jet destroyed before time is up -> restart the same style immediately.
+		bool dead = (gameUI && gameUI.Mode == 1) || (startHP >= 0 && !player) || (damage && damage.HP <= 0);
+		if (dead) {
+			reloading = true;
+			Time.timeScale = 1;
+			SceneManager.LoadScene (styleName);
+			return;
+		}
+
+		elapsed += Time.deltaTime;
+		if (elapsed >= GameSeconds) {
+			ended = true;
+			int hp = damage ? Mathf.Max (0, damage.HP) : 0;
+			armorLost = (startHP >= 0) ? Mathf.Max (0, startHP - hp) : 0;
+			int score = manager ? manager.Score : 0;
+			won = score > armorLost;
+			if (player)
+				player.Active = false;
+			Time.timeScale = 0;
+			Cursor.lockState = CursorLockMode.None;
+			Cursor.visible = true;
+		}
+	}
+
+	// ------------------------------------------------------------ drawing
+
+	GUIStyle Make (int size, TextAnchor anchor, bool bold, bool wrap)
+	{
+		GUIStyle s = new GUIStyle (GUI.skin.label);
+		s.fontSize = size;
+		s.alignment = anchor;
+		s.wordWrap = wrap;
+		s.richText = false;
+		s.fontStyle = bold ? FontStyle.Bold : FontStyle.Normal;
+		return s;
+	}
+
+	void BuildStyles ()
+	{
+		stylesBuilt = true;
+		sTitle = Make (34, TextAnchor.MiddleCenter, true, false);
+		sSub = Make (22, TextAnchor.MiddleCenter, true, false);
+		sBody = Make (16, TextAnchor.UpperCenter, false, true);
+		sSlogan = Make (18, TextAnchor.MiddleCenter, true, false);
+		sCredit = Make (14, TextAnchor.MiddleCenter, false, false);
+		sHint = Make (18, TextAnchor.MiddleCenter, true, false);
+		sHudL = Make (30, TextAnchor.UpperLeft, false, false);
+		sHudR = Make (30, TextAnchor.UpperRight, false, false);
+		sHudC = Make (30, TextAnchor.UpperCenter, false, false);
+		sSmallR = Make (16, TextAnchor.UpperRight, false, false);
+		sInfo = Make (24, TextAnchor.MiddleCenter, true, false);
+		sFa = Make (36, TextAnchor.MiddleCenter, true, false);
+
+		if (persianFont == null)
+			persianFont = Font.CreateDynamicFontFromOSFont (new string[] { "Arial", "Tahoma", "Segoe UI", "Arial Unicode MS" }, 36);
+		if (persianFont != null)
+			sFa.font = persianFont;
+	}
+
+	void OnGUI ()
+	{
+		if (mode == Mode.None)
+			return;
+		if (skin)
+			GUI.skin = skin;
+		if (!stylesBuilt)
+			BuildStyles ();
+
+		if (mode == Mode.Live)
+			DrawLive ();
+		else
+			DrawGame ();
+	}
+
+	void DrawLive ()
+	{
+		float w = Screen.width;
+		float h = Screen.height;
+		float boxH = 250;
+
+		if (logo) {
+			float y0 = h / 2 - 150;
+			float avail = (h - boxH) - y0;
+			float s = Mathf.Clamp (Mathf.Min (1f, Mathf.Min (avail / logo.height, w * 0.9f / logo.width)), 0.1f, 1f);
+			GUI.DrawTexture (new Rect (w / 2 - logo.width * s / 2, y0, logo.width * s, logo.height * s), logo);
+		}
+
+		GUI.color = new Color (0, 0, 0, 0.55f);
+		GUI.DrawTexture (new Rect (0, h - boxH, w, boxH), Texture2D.whiteTexture);
+		GUI.color = Color.white;
+
+		float top = h - boxH;
+		float bodyW = Mathf.Min (w - 80, 900);
+
+		if (ShowStartHint)
+			GUI.Label (new Rect (0, top + 8, w, 26), "PRESS ENTER TO START", sHint);
+		GUI.Label (new Rect (0, top + 34, w, 44), "DEFEND YOUR HOMELAND", sTitle);
+		GUI.Label (new Rect (0, top + 80, w, 30), "THE SKY IS YOUR BATTLEFIELD", sSub);
+		GUI.Label (new Rect ((w - bodyW) / 2, top + 114, bodyW, 56),
+			"Enemy forces are approaching. Take control of your fighter jet, engage hostile targets, and defend your homeland. The mission is yours. The skies are waiting.", sBody);
+		GUI.Label (new Rect (0, top + 176, w, 28), "YOUR MISSION. YOUR COURAGE. YOUR HOMELAND.", sSlogan);
+		GUI.Label (new Rect (0, top + 210, w, 26), "CREATED & POWERED BY BAZYNO.COM", sCredit);
+	}
+
+	void DrawGame ()
+	{
+		float w = Screen.width;
+		float h = Screen.height;
+
+		int kills = manager ? manager.Killed : 0;
+		int score = manager ? manager.Score : 0;
+		int hp = damage ? damage.HP : 0;
+		int remaining = Mathf.CeilToInt (Mathf.Max (0f, GameSeconds - elapsed));
+
+		GUI.Label (new Rect (20, 20, 220, 50), "Kills " + kills, sHudL);
+		GUI.Label (new Rect (20, 60, 220, 50), "Score " + score, sHudL);
+		GUI.Label (new Rect (w / 2 - 110, 20, 220, 50), "TIME " + (remaining / 60) + ":" + (remaining % 60).ToString ("00"), sHudC);
+		GUI.Label (new Rect (w - 240, 20, 220, 50), "ARMOR " + Mathf.Max (0, hp), sHudR);
+
+		WeaponLauncher wl = weapon ? weapon.GetCurrentWeapon () : null;
+		if (wl != null) {
+			if (wl.Icon)
+				GUI.DrawTexture (new Rect (w - 100, h - 100, 80, 80), wl.Icon);
+			if (!wl.InfinityAmmo) {
+				if (wl.Ammo <= 0 && wl.ReloadingProcess > 0)
+					GUI.Label (new Rect (w - 230, h - 120, 200, 30), "Reloading " + Mathf.Floor ((1 - wl.ReloadingProcess) * 100) + "%", sSmallR);
+				else
+					GUI.Label (new Rect (w - 230, h - 120, 200, 30), wl.Ammo.ToString (), sSmallR);
+			}
+		}
+
+		if (ended) {
+			GUI.color = new Color (0, 0, 0, 0.65f);
+			GUI.DrawTexture (new Rect (0, 0, w, h), Texture2D.whiteTexture);
+			GUI.color = Color.white;
+
+			DrawPersian (won ? MsgSuccess : MsgFail, h / 2 - 90, Mathf.Min (w - 80, 1000));
+			GUI.Label (new Rect (0, h / 2 + 20, w, 40), "SCORE " + score + "     ARMOR LOST " + armorLost, sInfo);
+			GUI.Label (new Rect (0, h / 2 + 70, w, 30), "PRESS ENTER TO CONTINUE", sHint);
+		}
+	}
+
+	// ------------------------------------------------------------ Persian text (IMGUI has no RTL / letter joining)
+
+	void DrawPersian (string text, float y, float maxWidth)
+	{
+		float w = Screen.width;
+		float lineH = sFa.fontSize * 1.5f;
+		string[] words = text.Split (' ');
+		List<string> lines = new List<string> ();
+		string current = "";
+		for (int i = 0; i < words.Length; i++) {
+			string candidate = current.Length == 0 ? words [i] : current + " " + words [i];
+			if (current.Length > 0 && sFa.CalcSize (new GUIContent (Visual (candidate))).x > maxWidth) {
+				lines.Add (current);
+				current = words [i];
+			} else {
+				current = candidate;
+			}
+		}
+		if (current.Length > 0)
+			lines.Add (current);
+
+		for (int i = 0; i < lines.Count; i++)
+			GUI.Label (new Rect (0, y + i * lineH, w, lineH), Visual (lines [i]), sFa);
+	}
+
+	static string Visual (string logical)
+	{
+		return ReverseKeepingLtr (Shape (logical));
+	}
+
+	// letter -> { isolated, final, initial, medial } (0 = form does not exist)
+	static Dictionary<char, char[]> forms;
+
+	static void Add (int c, int iso, int fin, int ini, int med)
+	{
+		forms [(char)c] = new char[] { (char)iso, (char)fin, (char)ini, (char)med };
+	}
+
+	static void InitForms ()
+	{
+		if (forms != null)
+			return;
+		forms = new Dictionary<char, char[]> ();
+		Add (0x0621, 0xFE80, 0, 0, 0);
+		Add (0x0622, 0xFE81, 0xFE82, 0, 0);
+		Add (0x0623, 0xFE83, 0xFE84, 0, 0);
+		Add (0x0624, 0xFE85, 0xFE86, 0, 0);
+		Add (0x0625, 0xFE87, 0xFE88, 0, 0);
+		Add (0x0626, 0xFE89, 0xFE8A, 0xFE8B, 0xFE8C);
+		Add (0x0627, 0xFE8D, 0xFE8E, 0, 0);
+		Add (0x0628, 0xFE8F, 0xFE90, 0xFE91, 0xFE92);
+		Add (0x0629, 0xFE93, 0xFE94, 0, 0);
+		Add (0x062A, 0xFE95, 0xFE96, 0xFE97, 0xFE98);
+		Add (0x062B, 0xFE99, 0xFE9A, 0xFE9B, 0xFE9C);
+		Add (0x062C, 0xFE9D, 0xFE9E, 0xFE9F, 0xFEA0);
+		Add (0x062D, 0xFEA1, 0xFEA2, 0xFEA3, 0xFEA4);
+		Add (0x062E, 0xFEA5, 0xFEA6, 0xFEA7, 0xFEA8);
+		Add (0x062F, 0xFEA9, 0xFEAA, 0, 0);
+		Add (0x0630, 0xFEAB, 0xFEAC, 0, 0);
+		Add (0x0631, 0xFEAD, 0xFEAE, 0, 0);
+		Add (0x0632, 0xFEAF, 0xFEB0, 0, 0);
+		Add (0x0633, 0xFEB1, 0xFEB2, 0xFEB3, 0xFEB4);
+		Add (0x0634, 0xFEB5, 0xFEB6, 0xFEB7, 0xFEB8);
+		Add (0x0635, 0xFEB9, 0xFEBA, 0xFEBB, 0xFEBC);
+		Add (0x0636, 0xFEBD, 0xFEBE, 0xFEBF, 0xFEC0);
+		Add (0x0637, 0xFEC1, 0xFEC2, 0xFEC3, 0xFEC4);
+		Add (0x0638, 0xFEC5, 0xFEC6, 0xFEC7, 0xFEC8);
+		Add (0x0639, 0xFEC9, 0xFECA, 0xFECB, 0xFECC);
+		Add (0x063A, 0xFECD, 0xFECE, 0xFECF, 0xFED0);
+		Add (0x0641, 0xFED1, 0xFED2, 0xFED3, 0xFED4);
+		Add (0x0642, 0xFED5, 0xFED6, 0xFED7, 0xFED8);
+		Add (0x0644, 0xFEDD, 0xFEDE, 0xFEDF, 0xFEE0);
+		Add (0x0645, 0xFEE1, 0xFEE2, 0xFEE3, 0xFEE4);
+		Add (0x0646, 0xFEE5, 0xFEE6, 0xFEE7, 0xFEE8);
+		Add (0x0647, 0xFEE9, 0xFEEA, 0xFEEB, 0xFEEC);
+		Add (0x0648, 0xFEED, 0xFEEE, 0, 0);
+		Add (0x067E, 0xFB56, 0xFB57, 0xFB58, 0xFB59); // پ
+		Add (0x0686, 0xFB7A, 0xFB7B, 0xFB7C, 0xFB7D); // چ
+		Add (0x0698, 0xFB8A, 0xFB8B, 0, 0);           // ژ
+		Add (0x06A9, 0xFB8E, 0xFB8F, 0xFB90, 0xFB91); // ک
+		Add (0x06AF, 0xFB92, 0xFB93, 0xFB94, 0xFB95); // گ
+		Add (0x06CC, 0xFBFC, 0xFBFD, 0xFBFE, 0xFBFF); // ی
+	}
+
+	static bool CanJoinNext (char c)
+	{
+		char[] f;
+		return forms.TryGetValue (c, out f) && f [2] != 0;
+	}
+
+	static bool CanJoinPrev (char c)
+	{
+		char[] f;
+		return forms.TryGetValue (c, out f) && f [1] != 0;
+	}
+
+	static string Shape (string s)
+	{
+		InitForms ();
+		char[] chars = s.ToCharArray ();
+		for (int i = 0; i < chars.Length; i++) {
+			if (chars [i] == 'ي') chars [i] = 'ی'; // Arabic yeh -> Persian yeh
+			else if (chars [i] == 'ك') chars [i] = 'ک'; // Arabic kaf -> Persian kaf
+		}
+
+		StringBuilder sb = new StringBuilder ();
+		int n = chars.Length;
+		for (int i = 0; i < n; i++) {
+			char c = chars [i];
+			if (c == '‌') // zero-width non-joiner: only breaks joining
+				continue;
+			char[] f;
+			if (!forms.TryGetValue (c, out f)) {
+				sb.Append (c);
+				continue;
+			}
+			bool joinPrev = i > 0 && CanJoinNext (chars [i - 1]);
+
+			// lam + alef ligature
+			if (c == 'ل' && i + 1 < n && (chars [i + 1] == 'ا' || chars [i + 1] == 'آ')) {
+				bool madda = chars [i + 1] == 'آ';
+				if (joinPrev)
+					sb.Append (madda ? 'ﻶ' : 'ﻼ');
+				else
+					sb.Append (madda ? 'ﻵ' : 'ﻻ');
+				i++;
+				continue;
+			}
+
+			bool joinNext = f [2] != 0 && i + 1 < n && CanJoinPrev (chars [i + 1]);
+			char outc;
+			if (joinPrev && joinNext && f [3] != 0)
+				outc = f [3];
+			else if (joinPrev && f [1] != 0)
+				outc = f [1];
+			else if (joinNext && f [2] != 0)
+				outc = f [2];
+			else
+				outc = f [0];
+			sb.Append (outc);
+		}
+		return sb.ToString ();
+	}
+
+	static bool IsLtr (char c)
+	{
+		return c < 0x0590 && char.IsLetterOrDigit (c);
+	}
+
+	// Reverse a shaped right-to-left line for the left-to-right IMGUI renderer, keeping Latin words / numbers readable.
+	static string ReverseKeepingLtr (string s)
+	{
+		List<string> tokens = new List<string> ();
+		StringBuilder run = new StringBuilder ();
+		for (int i = 0; i < s.Length; i++) {
+			if (IsLtr (s [i])) {
+				run.Append (s [i]);
+			} else {
+				if (run.Length > 0) {
+					tokens.Add (run.ToString ());
+					run.Length = 0;
+				}
+				tokens.Add (s [i].ToString ());
+			}
+		}
+		if (run.Length > 0)
+			tokens.Add (run.ToString ());
+
+		StringBuilder result = new StringBuilder ();
+		for (int i = tokens.Count - 1; i >= 0; i--)
+			result.Append (tokens [i]);
+		return result.ToString ();
+	}
+}

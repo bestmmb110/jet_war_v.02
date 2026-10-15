@@ -1,0 +1,55 @@
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+// New, standalone script. It does not modify any original Air Strike file.
+// 1) When you press Play (from any scene), the live auto-battle scene ("Mainmenu") is shown first.
+// 2) While playing Classic / Modern / Invasion, pressing Esc returns to the live battle scene.
+public class LiveBattleStart : MonoBehaviour
+{
+	const string LiveScene = "Mainmenu";
+	static bool bootDone;
+
+	[RuntimeInitializeOnLoadMethod (RuntimeInitializeLoadType.AfterSceneLoad)]
+	static void Boot ()
+	{
+		if (bootDone)
+			return;
+		bootDone = true;
+
+		GameObject go = new GameObject ("LiveBattleStart");
+		DontDestroyOnLoad (go);
+		go.AddComponent<LiveBattleStart> ();
+
+		// Show the live battle first, whichever scene was open when Play was pressed.
+		if (SceneManager.GetActiveScene ().name != LiveScene)
+			SceneManager.LoadScene (LiveScene);
+	}
+
+	void OnEnable ()
+	{
+		SceneManager.sceneLoaded += OnSceneLoaded;
+	}
+
+	void OnDisable ()
+	{
+		SceneManager.sceneLoaded -= OnSceneLoaded;
+	}
+
+	void OnSceneLoaded (Scene scene, LoadSceneMode mode)
+	{
+		// Undo the freeze left by the original pause screen and make the cursor usable.
+		Time.timeScale = 1;
+		if (scene.name == LiveScene) {
+			Cursor.lockState = CursorLockMode.None;
+			Cursor.visible = true;
+		}
+	}
+
+	void Update ()
+	{
+		if (Input.GetKeyDown (KeyCode.Escape) && SceneManager.GetActiveScene ().name != LiveScene) {
+			Time.timeScale = 1;
+			SceneManager.LoadScene (LiveScene);
+		}
+	}
+}
